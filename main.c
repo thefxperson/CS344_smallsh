@@ -6,6 +6,15 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <fcntl.h>
+
+
+// for tracking running processes
+struct proc_list {
+  pid_t* processes;
+  int n_processes;
+};
+
 
 short get_cmd_type(char* full_cmd){
   //process string like csv with spaces as separator
@@ -111,6 +120,18 @@ bool check_blank_line(char* cmd){
 }
 
 
+// trailing spaces on commands fucks my shit up, so use this help func to remove them
+char* remove_trailing_spaces(char* cmd){
+  int len = strlen(cmd);
+  if(cmd[len-1] == ' '){
+    cmd[len-1] = '\0';
+    return remove_trailing_spaces(cmd);
+  }else{
+    return cmd;
+  }
+}
+
+
 struct cmd_info {
   char** cmd_args;      //cmd_args[0] is actual command
   int argc;             // number of args
@@ -130,6 +151,9 @@ struct cmd_info* process_cmd(char* cmd){
   procd_cmd->input_file = NULL;
   procd_cmd->output_file = NULL;
   procd_cmd->background = false;
+
+  // remove trailing spaces
+  cmd = remove_trailing_spaces(cmd);
 
   // count number of spaces to make tokenization easier
   // idgaf about speed
@@ -278,7 +302,14 @@ void my_cd(struct cmd_info* cmd){
 
 
 void my_status(int status_code){
-  printf("Exit value: %d\n", status_code);
+  int decoded_status = 0;
+  if(WIFEXITED(status_code)){
+    decoded_status = WEXITSTATUS(status_code);
+    printf("Exit value: %d\n", decoded_status);
+  }else{
+    decoded_status = WTERMSIG(status_code);
+    printf("Terminated by signal %d\n", decoded_status);
+  }
 }
 
 
@@ -286,23 +317,19 @@ void my_status(int status_code){
 // if input_file == NULL, redirect from dev/null
 // return 0 on success, 1 on error
 int redirect_input(char* input_file, int* fd){
-  char target[2048];
-  if(input_file == NULL){
-    // redirect from dev/null
-    target = "/dev/null";
-  else{
+  char target[2048] = "/dev/null";
+  if(input_file !=  NULL)
     strcpy(target, input_file);
-  }
 
   // open source file
   *fd = open(target, O_RDONLY);
-  if(fd == -1){
+  if(*fd == -1){
     perror("redirect in open()");
     return 1;
   }
 
   // redirect input
-  int result = dup2(fd, 0);
+  int result = dup2(*fd, 0);
   if(result == -1){
     perror("redirect in dup2()");
     return 1;
@@ -316,23 +343,19 @@ int redirect_input(char* input_file, int* fd){
 // if output_file == NULL, redirect from dev/null
 // return 0 on success, 1 on error
 int redirect_output(char* output_file, int* fd){
-  char target[2048];
-  if(output_file == NULL){
-    // redirect from dev/null
-    target = "/dev/null";
-  else{
+  char target[2048] = "/dev/null";
+  if(output_file != NULL)
     strcpy(target, output_file);
-  }
 
   // open source file
   *fd = open(target, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if(fd == -1){
+  if(*fd == -1){
     perror("redirect out open()");
     return 1;
   }
 
   // redirect input
-  int result = dup2(fd, 1);
+  int result = dup2(*fd, 1);
   if(result == -1){
     perror("redirect out dup2()");
     return 1;
@@ -345,7 +368,7 @@ int redirect_output(char* output_file, int* fd){
 // function to handle spawning and management of external (non-native) commands
 // if return 0 -> fine
 // else -> error, clean memory and exit main
-int handle_extern(struct cmd_info* cmd, int* status){
+int handle_extern(struct cmd_info* cmd, int* status, struct proc_list* pids){
   // change behavior based on if cmd is ran in foreground or background
   // handle input/output redirection
   if(!cmd->background){
@@ -358,10 +381,25 @@ int handle_extern(struct cmd_info* cmd, int* status){
         perror("fork() failed");
         return 1;
       case 0:
-        // child process
+        // check if input or output need to be redirected
+        ; // blank statement so c can handle int declaration next line
+        int in_fd = -5, out_fd = -5, redirect_error = 0;
+        if(cmd->input_file != NULL)
+          redirect_error = redirect_input(cmd->input_file, &in_fd);
+        if(cmd->output_file != NULL)
+          redirect_error = redirect_output(cmd->output_file, &out_fd);
+
+        // check if there was an error redirecting in/out put
+        if(redirect_error == 1)
+          return redirect_error;
+
+        // exec child process
         execvp(cmd->cmd_args[0], cmd->cmd_args);
         // exec only returns on error
         perror("execvp");
+        // clean file descriptors
+        if(in_fd != -5){close(in_fd);}
+        if(out_fd != -5){close(out_fd);}
         return 1;
       default:
         // parent process
@@ -370,9 +408,111 @@ int handle_extern(struct cmd_info* cmd, int* status){
     }
   }else{
     // run in background
+    pid_t spawn_pid = -5;
+    spawn_pid = fork();
+    switch(spawn_pid){
+      case -1:
+        // fork failed
+        perror("fork() failed");
+        return 1;
+      case 0:
+        // child process
+        // check if input or output need to be redirected
+        ; // blank statement so c can handle int declaration next line
+        int in_fd = -5, out_fd = -5, redirect_error = 0;
+
+        // redirect regardless of status because background process
+        redirect_error = redirect_input(cmd->input_file, &in_fd);
+        redirect_error = redirect_output(cmd->output_file, &out_fd);
+
+        // check if there was an error redirecting in/out put
+        if(redirect_error == 1)
+          return redirect_error;
+
+        // exec child process
+        execvp(cmd->cmd_args[0], cmd->cmd_args);
+        // exec only returns on error
+        perror("execvp");
+        // clean file descriptors
+        close(in_fd);
+        close(out_fd);
+        return 1;
+      default:
+        // parent process
+        printf("Background process spawned with id %d\n", spawn_pid);
+        fflush(stdout);
+        // add pid to list of running pids
+        pids->n_processes++;
+        pid_t* new_pids = malloc(pids->n_processes*sizeof(pid_t));
+        for(int i = 0; i < pids->n_processes-1; i++){
+          new_pids[i] = pids->processes[i];
+        }
+        new_pids[pids->n_processes-1] = spawn_pid;
+        free(pids->processes);
+        pids->processes = new_pids;
+
+        break;
+    }
   }
   return 0;
 }
+
+
+// process to check to see if background tasks are still running and to clean
+// resources if they have exited
+void cull_processes(struct proc_list* pids){
+  // only run if in parent process
+  // just to avoid nasty bugs that i don't understand
+  if(pids->processes[0] !=  getpid())
+    return;
+ 
+  // start i at one because proc[0] is always parent's pid
+  int status = 0;
+  pid_t running_check = -1;
+  for(int i = 1; i < pids->n_processes; i++){
+    // check status of background pids
+    running_check = waitpid(pids->processes[i], &status, WNOHANG);
+    if(running_check == 0){
+      // process is still running
+      continue;
+    }else if(running_check == -1){
+      printf("Error checking status of process %d\n", pids->processes[i]);
+      fflush(stdout);
+      continue;
+    }
+    // only reach this if process has exited
+    // check and return status
+    int decoded_status = 0;
+    if(WIFEXITED(status)){
+      decoded_status = WEXITSTATUS(status);
+      printf("Process %d exited with value: %d\n", running_check, decoded_status);
+    }else{
+      decoded_status = WTERMSIG(status);
+      printf("Process %d terminated by signal %d\n", running_check, decoded_status);
+    }
+
+    // update list of running processes
+    pid_t* new_procs = malloc((pids->n_processes-1)*sizeof(pid_t));
+    int skipped = 0;
+    for(int j = 0; j < pids->n_processes; j++){
+      if(i == j){ skipped = 1; continue;} //skip process that just terminated
+      new_procs[j-skipped] = pids->processes[j];
+    }
+    // finish cleaning memory and 
+    free(pids->processes);
+    pids->processes = new_procs;
+    pids->n_processes--;
+
+    // NOTE: this decrements the bounds and indices of the currently running outer for loop
+    // with iterator i. We need the loop to continue iterating within the new bounds,
+    // without skipping any elements. original idea was use of a goto statement, but that
+    // can be simplified down to simply decrementing i, so it will have the same value
+    // for two loops in a row, but be accessing two separate elements. Loop bounds are
+    // already managed by pids->n_processes.
+    i--;
+  }
+}
+
 
 int main(int argc, char** argv){
   // main loop for smallsh
@@ -382,6 +522,11 @@ int main(int argc, char** argv){
   short cmd_code = 0;
   int status_code = 0;
   int proc_success = 0;
+  struct proc_list* running_procs = malloc(sizeof(struct proc_list));
+  running_procs->processes = malloc(sizeof(pid_t));
+  running_procs->n_processes = 1;
+  running_procs->processes[0] = getpid();
+
   while(running){
     // realloc new_cmd with proper length
     new_cmd = realloc(new_cmd, 2049); //2048 max plus null
@@ -422,8 +567,8 @@ int main(int argc, char** argv){
         break;
       case 3:
         // external command
-        print_cmd_info(cmd);
-        proc_success = handle_extern(cmd, &status_code);
+        //print_cmd_info(cmd);
+        proc_success = handle_extern(cmd, &status_code, running_procs);
         if (proc_success != 0)   // this normally means execvp failed, clear mem in child proc and exit
           running = false;
 
@@ -434,9 +579,14 @@ int main(int argc, char** argv){
 
     // free memory
     delete_cmd_info(cmd);
+
+    // cull background processes
+    cull_processes(running_procs);
   }
 
   // clean up memory
   free(new_cmd);
-  return 0;
+  free(running_procs->processes);
+  free(running_procs);
+  return proc_success;
 }
